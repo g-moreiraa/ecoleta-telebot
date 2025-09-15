@@ -62,27 +62,21 @@ function inMemoryStore(): Store {
 // Desembrulha recursivamente respostas do Upstash (value/ex) e strings JSON
 function unwrapUpstash<T>(input: any): T | undefined {
   let cur: any = input;
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < 6; i++) {
     if (cur == null) return undefined;
 
-    // Caso 1: envelope { value: ..., ex?: ... }
+    // Envelope { value: "...", ex?: number }
     if (typeof cur === "object" && "value" in cur) {
       cur = (cur as any).value;
       continue;
     }
 
-    // Caso 2: string JSON
+    // String JSON
     if (typeof cur === "string") {
-      try {
-        cur = JSON.parse(cur);
-        continue; // pode haver outro nível dentro
-      } catch {
-        // não é JSON: retorna a string como está
-        return cur as T;
-      }
+      try { cur = JSON.parse(cur); continue; } catch { return cur as T; }
     }
 
-    // Caso 3: já é o objeto final
+    // Objeto final
     return cur as T;
   }
   return cur as T;
@@ -103,8 +97,7 @@ function upstashStore(url: string, token: string): Store {
         }
         const { result } = await r.json();
         if (result == null) return undefined;
-        const parsed = unwrapUpstash<T>(result);
-        return parsed;
+        return unwrapUpstash<T>(result);
       } catch (e) {
         console.error("[UPSTASH][GET] erro:", e);
         return undefined;
@@ -115,7 +108,6 @@ function upstashStore(url: string, token: string): Store {
         const r = await fetch(`${url}/set/${encodeURIComponent(key)}`, {
           method: "POST",
           headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-          // salvamos como string JSON (Upstash armazena strings)
           body: JSON.stringify({ value: JSON.stringify(value), ex: ttlSec }),
         });
         if (!r.ok) {
@@ -300,7 +292,7 @@ bot.command("debug", async (ctx) => {
   );
 });
 
-// KVTEST para testar Upstash set/get (já imprime desembrulhado)
+// KVTEST para testar Upstash (mostra raw e unwrapped)
 bot.command("kvtest", async (ctx) => {
   const key = `ecoleta:test:${Date.now()}`;
   const value = { ok: true, ts: Date.now() };
@@ -408,7 +400,7 @@ bot.on("callback_query:data", async (ctx) => {
   const chatId = ctx.chat!.id;
   const d = await getDraft(chatId);
 
-  // Confirmação da classe
+  // Confirmação
   if (key === "confirm") {
     if (payload === "yes") {
       await mergeDraft(chatId, { step: "await_qty" as const });
@@ -461,6 +453,8 @@ bot.on("callback_query:data", async (ctx) => {
     const addr = nd.address!;
     const user = nd.user!;
     const item = nd.item!;
+    const dateStr = new Intl.DateTimeFormat("pt-BR", { dateStyle: "medium" }).format(new Date(dayISO));
+
     const resumo = [
       "✅ *Pedido de coleta registrado!*",
       `• Nome: *${user.name}*`,
@@ -469,12 +463,18 @@ bot.on("callback_query:data", async (ctx) => {
       `• Item: *${toPT(item.label)}*`,
       `• Quantidade: *${nd.qty}*`,
       `• Endereço: *${formatAddressPT(addr)}*`,
-      `• Data/Hora: *${new Intl.DateTimeFormat("pt-BR", { dateStyle: "medium" }).format(new Date(dayISO))} às *${time}*`,
+      `• Data/Hora: *${dateStr}* às *${time}*`,
       "",
       "_(Aviso: em ambiente serverless o estado pode reiniciar no cold start.)_",
     ].join("\n");
 
-    return ctx.editMessageText(resumo, { parse_mode: "Markdown" });
+    try {
+      await ctx.editMessageText(resumo, { parse_mode: "Markdown" });
+    } catch (e) {
+      console.error("editMessageText falhou, enviando como reply:", e);
+      await ctx.reply(resumo, { parse_mode: "Markdown" });
+    }
+    return;
   }
 
   if (key === "cancel") {
