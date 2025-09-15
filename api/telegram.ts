@@ -3,45 +3,38 @@ import { Bot, InlineKeyboard, webhookCallback } from "grammy";
 import axios from "axios";
 import FormData from "form-data";
 
-// Força Node no Vercel (serverless) e dá folga pra cold start
+// força Node e dá folga pra cold start
 export const config = { runtime: "nodejs", maxDuration: 10 };
 
 const token = process.env.TELEGRAM_TOKEN!;
 const PREDICT_URL = process.env.PREDICT_URL!;
 const API_KEY = process.env.API_KEY || "";
 
+// Upstash Redis (REST)
+const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL!;
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN!;
+
 if (!token) throw new Error("TELEGRAM_TOKEN ausente");
 if (!PREDICT_URL) throw new Error("PREDICT_URL ausente");
+if (!UPSTASH_URL || !UPSTASH_TOKEN) {
+  console.warn("⚠️ UPSTASH_REDIS_REST_URL/TOKEN ausentes — o estado pode se perder em cold start.");
+}
 
-// ===== Tipos e estado =====
 type Pred = { label: string; score: number };
 type UserInfo = { name?: string; cpf?: string; phone?: string };
 type Address = {
-  cep?: string;
-  logradouro?: string;
-  bairro?: string;
-  localidade?: string;
-  uf?: string;
-  numero?: string;
-  complemento?: string;
+  cep?: string; logradouro?: string; bairro?: string; localidade?: string; uf?: string;
+  numero?: string; complemento?: string
 };
 type Schedule = { day?: string; time?: string };
 type Step =
-  | "name"
-  | "cpf"
-  | "phone"
-  | "await_photo"
-  | "confirm_item"
-  | "await_qty"
-  | "await_cep"
-  | "await_number"
-  | "await_day"
-  | "await_time";
+  | "name" | "cpf" | "phone"
+  | "await_photo" | "await_confirm" | "await_qty" | "await_cep" | "await_number" | "await_day" | "await_time";
 
 type Draft = {
   step?: Step;
   user?: UserInfo;
-  item?: Pred; // apenas label/score; score não exibido
+  item?: Pred;
   qty?: number;
   address?: Address;
   schedule?: Schedule;
@@ -49,9 +42,47 @@ type Draft = {
   latestFileUrl?: string;
 };
 
-const drafts = new Map<number, Draft>();
+// ---------- Persistência (Upstash Redis REST) ----------
+const DRAFT_TTL = 60 * 60 * 2; // 2h
 
-// ===== Mapeamento EN -> PT dos rótulos =====
+async function kvGet<T>(key: string): Promise<T | undefined> {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return undefined;
+  const r = await fetch(`${UPSTASH_URL}/get/${encodeURIComponent(key)}`, {
+    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
+    cache: "no-store",
+  });
+  if (!r.ok) return undefined;
+  const { result } = await r.json();
+  if (!result) return undefined;
+  try { return JSON.parse(result) as T; } catch { return undefined; }
+}
+
+async function kvSet<T>(key: string, value: T, ttlSec = DRAFT_TTL): Promise<void> {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return;
+  await fetch(`${UPSTASH_URL}/set/${encodeURIComponent(key)}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ value: JSON.stringify(value), ex: ttlSec }),
+  });
+}
+
+const draftKey = (chatId: number) => `ecoleta:draft:${chatId}`;
+
+async function getDraft(chatId: number): Promise<Draft> {
+  const d = await kvGet<Draft>(draftKey(chatId));
+  return d ?? { step: "name", user: {}, address: {}, schedule: {} };
+}
+async function setDraft(chatId: number, draft: Draft) {
+  await kvSet(draftKey(chatId), draft, DRAFT_TTL);
+}
+async function mergeDraft(chatId: number, partial: Partial<Draft>) {
+  const d = await getDraft(chatId);
+  const nd = { ...d, ...partial };
+  await setDraft(chatId, nd);
+  return nd;
+}
+
+// ---------- EN -> PT ----------
 const LABEL_PT: Record<string, string> = {
   Battery: "Bateria",
   Keyboard: "Teclado",
@@ -66,9 +97,9 @@ const LABEL_PT: Record<string, string> = {
 };
 const toPT = (en: string) => LABEL_PT[en] ?? en;
 
-// ===== Helpers comuns =====
 const bot = new Bot(token);
 
+// ---------- helpers HTTP/IA ----------
 async function getFileUrl(fileId: string): Promise<string> {
   const f = await bot.api.getFile(fileId);
   return `https://api.telegram.org/file/bot${token}/${f.file_path}`;
@@ -84,18 +115,12 @@ async function classifyImage(bytes: Buffer, topk = 1): Promise<Pred[]> {
   const headers: Record<string, string> = { ...(form.getHeaders?.() || {}) };
   if (API_KEY) headers["X-API-Key"] = API_KEY;
   const { data } = await axios.post(`${PREDICT_URL}?topk=${topk}`, form as any, {
-    headers,
-    timeout: 20000,
-    maxBodyLength: Infinity,
+    headers, timeout: 20000, maxBodyLength: Infinity,
   });
   return data.topk as Pred[];
 }
 
-// ===== Validações simples =====
-function onlyDigits(s: string) {
-  return (s || "").replace(/\D/g, "");
-}
-// CPF: validação de dígitos verificadores (básica)
+const onlyDigits = (s: string) => (s || "").replace(/\D/g, "");
 function isValidCPF(cpfRaw: string): boolean {
   const cpf = onlyDigits(cpfRaw);
   if (!cpf || cpf.length !== 11) return false;
@@ -110,22 +135,12 @@ function isValidCPF(cpfRaw: string): boolean {
   const d2 = calc(cpf.slice(0, 10), 11);
   return d1 === parseInt(cpf[9]) && d2 === parseInt(cpf[10]);
 }
-function isValidPhone(p: string): boolean {
-  const digits = onlyDigits(p);
-  // aceita 10 ou 11 dígitos (com DDD)
-  return digits.length === 10 || digits.length === 11;
-}
-
-// ===== ViaCEP =====
-type ViaCEP = {
-  cep?: string;
-  logradouro?: string;
-  bairro?: string;
-  localidade?: string;
-  uf?: string;
-  complemento?: string;
-  erro?: boolean;
+const isValidPhone = (p: string) => {
+  const d = onlyDigits(p);
+  return d.length === 10 || d.length === 11;
 };
+
+type ViaCEP = { cep?: string; logradouro?: string; bairro?: string; localidade?: string; uf?: string; complemento?: string; erro?: boolean; };
 async function fetchViaCEP(cep: string): Promise<ViaCEP> {
   const c = onlyDigits(cep);
   const { data } = await axios.get<ViaCEP>(`https://viacep.com.br/ws/${c}/json/`, { timeout: 8000 });
@@ -138,28 +153,23 @@ function formatAddressPT(a: Address) {
     a.localidade && a.uf ? `${a.localidade}/${a.uf}` : a.localidade || a.uf,
     a.complemento,
     a.cep && `CEP ${a.cep}`,
-  ].filter(Boolean);
+  ].filter(Boolean) as string[];
   return parts.join(" • ");
 }
 
-// ===== agendamento: botões para dia e hora =====
 const TIME_SLOTS = ["09:00", "11:00", "14:00", "16:00", "18:00"];
-function nextDays(n = 7): { iso: string; label: string }[] {
+function nextDays(n = 7) {
   const out: { iso: string; label: string }[] = [];
-  const fmtDay = new Intl.DateTimeFormat("pt-BR", { weekday: "short", day: "2-digit", month: "2-digit" });
+  const fmt = new Intl.DateTimeFormat("pt-BR", { weekday: "short", day: "2-digit", month: "2-digit" });
   for (let i = 0; i < n; i++) {
-    const d = new Date();
-    d.setDate(d.getDate() + i);
-    const iso = d.toISOString().slice(0, 10);
-    const label = fmtDay.format(d); // ex: seg., 16/09
-    out.push({ iso, label });
+    const d = new Date(); d.setDate(d.getDate() + i);
+    out.push({ iso: d.toISOString().slice(0, 10), label: fmt.format(d) });
   }
   return out;
 }
 function kbDays() {
   const kb = new InlineKeyboard();
-  const days = nextDays(7);
-  for (const d of days) kb.text(d.label, `day:${d.iso}`).row();
+  for (const d of nextDays(7)) kb.text(d.label, `day:${d.iso}`).row();
   kb.text("Cancelar", "cancel");
   return kb;
 }
@@ -172,107 +182,145 @@ function kbTimes(dayISO: string) {
 function kbQty() {
   const kb = new InlineKeyboard();
   for (let i = 1; i <= 6; i++) kb.text(String(i), `qty:${i}`).row();
-  kb.text("7-9", "qty:7").text("10+", "qty:other");
+  kb.text("7–9", "qty:range").text("10+", "qty:other");
   return kb;
 }
+function kbConfirm(labelPT: string) {
+  return new InlineKeyboard()
+    .text(`✅ Sim, é ${labelPT}`, "confirm:yes").row()
+    .text("❌ Não, enviar outra foto", "confirm:no");
+}
 
-// ===== fluxo =====
+// ---------- fluxo ----------
 bot.command("cancel", async (ctx) => {
-  drafts.set(ctx.chat!.id, {});
+  await setDraft(ctx.chat!.id, { step: "name", user: {}, address: {}, schedule: {} });
   await ctx.reply("Fluxo cancelado. Envie /start para começar novamente.");
 });
 
 bot.command("start", async (ctx) => {
-  drafts.set(ctx.chat!.id, { step: "name", user: {}, address: {}, schedule: {} });
+  await setDraft(ctx.chat!.id, { step: "name", user: {}, address: {}, schedule: {} });
   await ctx.reply("Olá! Eu sou o bot da E-Coleta ♻️\n\nVamos começar com seus dados.\n\n👉 *Seu nome completo?*", {
     parse_mode: "Markdown",
   });
 });
 
 bot.command("help", (ctx) =>
-  ctx.reply("Comandos: /start, /cancel.\nFluxo: Nome → CPF → Telefone → Foto/Arquivo → Quantidade → CEP → Número → Data/Hora.")
+  ctx.reply("Comandos: /start, /cancel.\nFluxo: Nome → CPF → Telefone → Foto/Arquivo → Confirmação → Quantidade → CEP → Número → Data/Hora.")
 );
 
-// ===== imagem (foto ou arquivo) =====
+// processa imagem
 async function handleImage(chatId: number, fileId: string) {
+  try { await bot.api.sendChatAction(chatId, "typing"); } catch {}
   const [buf, url] = await Promise.all([getFileBuffer(fileId), getFileUrl(fileId)]);
   const preds = await classifyImage(buf, 1);
   if (!preds.length) throw new Error("Sem predições");
   const top = preds[0];
 
-  const d = drafts.get(chatId) || {};
-  drafts.set(chatId, {
-    ...d,
-    latestFileId: fileId,
-    latestFileUrl: url,
-    item: top,
-    step: "await_qty",
-  });
+  await mergeDraft(chatId, { latestFileId: fileId, latestFileUrl: url, item: top, step: "await_confirm" as const });
 
-  const kb = kbQty();
-  return { text: `Detectei: *${toPT(top.label)}*.\nQuantas unidades você deseja descartar?`, kb };
+  const labelPT = toPT(top.label);
+  return { text: `Detectei: *${labelPT}*.\nEstá correto?`, kb: kbConfirm(labelPT) };
 }
 
+// FOTO: se dados faltarem, guardo a foto e sigo pedindo os dados
 bot.on("message:photo", async (ctx) => {
   const chatId = ctx.chat!.id;
-  const d = drafts.get(chatId);
-  if (!d || !d.user?.name || !d.user?.cpf || !d.user?.phone) {
-    return ctx.reply("Antes, por favor informe Nome, CPF e Telefone. Envie /start para iniciar.");
+  const d = await getDraft(chatId);
+  const best = ctx.message.photo.at(-1)!;
+
+  await mergeDraft(chatId, { latestFileId: best.file_id }); // guarda a foto sempre
+
+  if (!d.user?.name) {
+    return ctx.reply("Antes de processar a foto, me informe seu *Nome completo*.", { parse_mode: "Markdown" });
   }
+  if (!d.user?.cpf) {
+    return ctx.reply("Agora, informe seu *CPF* (somente números).", { parse_mode: "Markdown" });
+  }
+  if (!d.user?.phone) {
+    return ctx.reply("Perfeito. Informe seu *telefone com DDD* (ex.: 11987654321).", { parse_mode: "Markdown" });
+  }
+
   try {
-    const best = ctx.message.photo.at(-1)!;
     const { text, kb } = await handleImage(chatId, best.file_id);
     await ctx.reply(text, { parse_mode: "Markdown", reply_markup: kb });
-  } catch (e) {
+  } catch (e: any) {
     console.error(e);
-    await ctx.reply("❌ Não consegui processar. Tente enviar como *Arquivo* (sem compressão).", { parse_mode: "Markdown" });
+    const msg = e?.code === "ECONNABORTED"
+      ? "⏱️ O servidor de IA demorou para responder. Tente novamente ou envie como *Arquivo* (sem compressão)."
+      : "❌ Não consegui processar. Tente enviar como *Arquivo* (sem compressão).";
+    await ctx.reply(msg, { parse_mode: "Markdown" });
   }
 });
 
+// DOCUMENTO (imagem como arquivo)
 bot.on("message:document", async (ctx) => {
   const chatId = ctx.chat!.id;
-  const d = drafts.get(chatId);
-  if (!d || !d.user?.name || !d.user?.cpf || !d.user?.phone) {
-    return ctx.reply("Antes, por favor informe Nome, CPF e Telefone. Envie /start para iniciar.");
-  }
+  const d = await getDraft(chatId);
   const doc = ctx.message.document;
+
   if (!doc.mime_type?.startsWith("image/")) {
     return ctx.reply("Envie um *arquivo de imagem* (JPG/PNG).", { parse_mode: "Markdown" });
   }
+
+  await mergeDraft(chatId, { latestFileId: doc.file_id }); // guarda a foto sempre
+
+  if (!d.user?.name) {
+    return ctx.reply("Antes de processar a foto, me informe seu *Nome completo*.", { parse_mode: "Markdown" });
+  }
+  if (!d.user?.cpf) {
+    return ctx.reply("Agora, informe seu *CPF* (somente números).", { parse_mode: "Markdown" });
+  }
+  if (!d.user?.phone) {
+    return ctx.reply("Perfeito. Informe seu *telefone com DDD* (ex.: 11987654321).", { parse_mode: "Markdown" });
+  }
+
   try {
     const { text, kb } = await handleImage(chatId, doc.file_id);
     await ctx.reply(text, { parse_mode: "Markdown", reply_markup: kb });
-  } catch (e) {
+  } catch (e: any) {
     console.error(e);
-    await ctx.reply("❌ Não consegui baixar/processar o arquivo. Tente novamente.");
+    const msg = e?.code === "ECONNABORTED"
+      ? "⏱️ O servidor de IA demorou para responder. Tente novamente ou envie como *Arquivo* (sem compressão)."
+      : "❌ Não consegui baixar/processar o arquivo. Tente novamente.";
+    await ctx.reply(msg, { parse_mode: "Markdown" });
   }
 });
 
-// ===== callback buttons (confirm item, qty, day/time, navegação) =====
+// CALLBACKS
 bot.on("callback_query:data", async (ctx) => {
   const data = ctx.callbackQuery.data ?? "";
+  try { await ctx.answerCallbackQuery(); } catch {}
 
-  // 1) SEMPRE reconhecer o callback primeiro (evita spinner infinito)
-  try { await ctx.answerCallbackQuery(); } catch { /* ignora */ }
-
-  // 2) Parse robusto: separa a chave e mantém o resto intacto (mesmo com ":")
   const [key, ...rest] = data.split(":");
-  const payload = rest.join(":"); // preserva "2025-09-16T14:00"
-
+  const payload = rest.join(":");
   const chatId = ctx.chat!.id;
-  const d = drafts.get(chatId) || {};
+  const d = await getDraft(chatId);
 
-  // quantidade
+  // Confirmação da classe
+  if (key === "confirm") {
+    if (payload === "yes") {
+      await mergeDraft(chatId, { step: "await_qty" as const });
+      return ctx.editMessageText("Perfeito! Quantas unidades você deseja descartar?", {
+        parse_mode: "Markdown", reply_markup: kbQty(),
+      });
+    }
+    if (payload === "no") {
+      await mergeDraft(chatId, { item: undefined, step: "await_photo" as const });
+      return ctx.editMessageText("Sem problemas. Envie outra *foto* do item (de preferência como *Arquivo* para melhor qualidade).", {
+        parse_mode: "Markdown",
+      });
+    }
+  }
+
+  // Quantidade
   if (key === "qty") {
-    if (payload === "other") {
-      drafts.set(chatId, { ...d, step: "await_qty" });
+    if (payload === "other" || payload === "range") {
+      await mergeDraft(chatId, { step: "await_qty" as const });
       return ctx.editMessageText("Digite a *quantidade* (número inteiro):", { parse_mode: "Markdown" });
     }
-    const q = Math.max(1, Math.min(99, Number(payload)));
-    drafts.set(chatId, { ...d, qty: q, step: "await_cep" });
-    return ctx.editMessageText(`Ok! Quantidade: *${q}*.\nAgora, informe seu *CEP* (somente números).`, {
-      parse_mode: "Markdown",
-    });
+    const q = Math.max(1, Math.min(999, Number(payload)));
+    await mergeDraft(chatId, { qty: q, step: "await_cep" as const });
+    return ctx.editMessageText(`Ok! Quantidade: *${q}*.\nAgora, informe seu *CEP* (somente números).`, { parse_mode: "Markdown" });
   }
 
   if (key === "back" && payload === "days") {
@@ -280,21 +328,27 @@ bot.on("callback_query:data", async (ctx) => {
   }
 
   if (key === "day") {
-    const dayISO = payload; // ex: 2025-09-16
-    drafts.set(chatId, { ...d, schedule: { ...(d.schedule || {}), day: dayISO }, step: "await_time" });
+    const dayISO = payload;
+    await mergeDraft(chatId, { schedule: { ...(d.schedule || {}), day: dayISO }, step: "await_time" as const });
     return ctx.editMessageText("Escolha um horário:", { reply_markup: kbTimes(dayISO) });
   }
 
   if (key === "time") {
-    const iso = payload; // ex: 2025-09-16T14:00
+    const iso = payload;           // ex: 2025-09-16T14:00
     const [dayISO, time] = iso.split("T");
-    const nd = { ...d, schedule: { day: dayISO, time } };
-    drafts.set(chatId, nd);
+    const nd = await mergeDraft(chatId, { schedule: { day: dayISO, time } });
+
+    // Guardas contra estado perdido
+    if (!nd.user?.name || !nd.user?.cpf || !nd.user?.phone || !nd.item || !nd.qty || !nd.address?.cep) {
+      return ctx.editMessageText(
+        "Quase lá! Parece que o servidor reiniciou e perdi parte do estado.\n\n" +
+        "👉 Envie /start para reiniciar rapidamente, ou reenvie o CEP para retomarmos o passo atual."
+      );
+    }
 
     const addr = nd.address!;
     const user = nd.user!;
     const item = nd.item!;
-
     const resumo = [
       "✅ *Pedido de coleta registrado!*",
       `• Nome: *${user.name}*`,
@@ -303,69 +357,77 @@ bot.on("callback_query:data", async (ctx) => {
       `• Item: *${toPT(item.label)}*`,
       `• Quantidade: *${nd.qty}*`,
       `• Endereço: *${formatAddressPT(addr)}*`,
-      `• Data/Hora: *${new Intl.DateTimeFormat("pt-BR", {
-        dateStyle: "medium",
-      }).format(new Date(dayISO))} às *${time}*`,
+      `• Data/Hora: *${new Intl.DateTimeFormat("pt-BR", { dateStyle: "medium" }).format(new Date(dayISO))} às *${time}*`,
       "",
-      "_(Demo serverless: estado pode reiniciar no cold start.)_",
+      "_(Aviso: em ambiente serverless o estado pode reiniciar no cold start.)_",
     ].join("\n");
 
     return ctx.editMessageText(resumo, { parse_mode: "Markdown" });
   }
 
   if (key === "cancel") {
-    drafts.set(chatId, {});
+    await setDraft(chatId, { step: "name", user: {}, address: {}, schedule: {} });
     return ctx.editMessageText("Fluxo cancelado. Envie /start para começar novamente.");
   }
 });
 
-
-// ===== fluxo de texto (dados do usuário, qty manual, CEP, número) =====
+// TEXTO: dados do usuário, qty manual, CEP, número
 bot.on("message:text", async (ctx) => {
   const chatId = ctx.chat!.id;
   const txt = (ctx.message.text || "").trim();
-  const d = drafts.get(chatId) || {};
+  const d = await getDraft(chatId);
 
-  // etapa inicial: nome -> cpf -> phone
-  if (!d.user?.name && d.step === "name") {
-    const user = { ...(d.user || {}), name: txt };
-    drafts.set(chatId, { ...d, user, step: "cpf" });
+  // nome -> cpf -> phone
+  if (d.step === "name" || !d.user?.name) {
+    await mergeDraft(chatId, { user: { ...(d.user || {}), name: txt }, step: "cpf" as const });
     return ctx.reply("Ótimo! Agora informe seu *CPF* (somente números).", { parse_mode: "Markdown" });
   }
-  if (!d.user?.cpf && (d.step === "cpf" || d.step === "name")) {
+
+  if (d.step === "cpf" || (!d.user?.cpf && d.user?.name)) {
     const cpf = onlyDigits(txt);
     if (!isValidCPF(cpf)) {
       return ctx.reply("CPF inválido. Tente novamente (somente números).");
     }
-    const user = { ...(d.user || {}), cpf: cpf.replace(/(\d{3})(\d{3})(\d{3})(\d{2})/, "$1.$2.$3-$4") };
-    drafts.set(chatId, { ...d, user, step: "phone" });
+    const cpfFmt = cpf.replace(/(\d{3})(\d{3})(\d{3})(\d{2})/, "$1.$2.$3-$4");
+    await mergeDraft(chatId, { user: { ...(d.user || {}), cpf: cpfFmt }, step: "phone" as const });
     return ctx.reply("Perfeito. Informe seu *telefone com DDD* (ex.: 11987654321).", { parse_mode: "Markdown" });
   }
-  if (!d.user?.phone && d.step === "phone") {
+
+  if (d.step === "phone" || (!d.user?.phone && d.user?.cpf)) {
     if (!isValidPhone(txt)) {
       return ctx.reply("Telefone inválido. Envie no formato com DDD (ex.: 11987654321).");
     }
     const digits = onlyDigits(txt);
-    const fmt =
-      digits.length === 11
-        ? digits.replace(/(\d{2})(\d{5})(\d{4})/, "($1) $2-$3")
-        : digits.replace(/(\d{2})(\d{4})(\d{4})/, "($1) $2-$3");
-    const user = { ...(d.user || {}), phone: fmt };
-    drafts.set(chatId, { ...d, user, step: "await_photo" });
-    return ctx.reply("Dados salvos! ✅ Agora, envie uma *foto* do item (ou como *Arquivo* para melhor qualidade).", {
-      parse_mode: "Markdown",
-    });
+    const fmt = digits.length === 11
+      ? digits.replace(/(\d{2})(\d{5})(\d{4})/, "($1) $2-$3")
+      : digits.replace(/(\d{2})(\d{4})(\d{4})/, "($1) $2-$3");
+    const nd = await mergeDraft(chatId, { user: { ...(d.user || {}), phone: fmt }, step: "await_photo" as const });
+
+    // se já tinha foto guardada, processa direto
+    if (nd.latestFileId) {
+      try {
+        const { text, kb } = await handleImage(chatId, nd.latestFileId);
+        return ctx.reply(text, { parse_mode: "Markdown", reply_markup: kb });
+      } catch (e: any) {
+        console.error(e);
+        const msg = e?.code === "ECONNABORTED"
+          ? "⏱️ O servidor de IA demorou para responder. Tente novamente ou envie como *Arquivo* (sem compressão)."
+          : "Recebi seus dados! Agora envie uma *foto* do item (ou *Arquivo* para melhor qualidade).";
+        return ctx.reply(msg, { parse_mode: "Markdown" });
+      }
+    }
+    return ctx.reply("Dados salvos! ✅ Agora, envie uma *foto* do item (ou como *Arquivo* para melhor qualidade).", { parse_mode: "Markdown" });
   }
 
-  // quantidade digitada manualmente
+  // quantidade manual
   if (d.step === "await_qty" && d.item && !d.qty) {
     const q = Number(onlyDigits(txt));
     if (!Number.isFinite(q) || q <= 0) return ctx.reply("Quantidade inválida. Envie um número inteiro maior que 0.");
-    drafts.set(chatId, { ...d, qty: Math.min(999, q), step: "await_cep" });
+    await mergeDraft(chatId, { qty: Math.min(999, q), step: "await_cep" as const });
     return ctx.reply("Agora, informe seu *CEP* (somente números).", { parse_mode: "Markdown" });
   }
 
-  // CEP -> ViaCEP -> pede número
+  // CEP -> ViaCEP -> número
   if (d.step === "await_cep" && d.item && d.qty && !d.address?.cep) {
     const cep = onlyDigits(txt);
     if (cep.length !== 8) return ctx.reply("CEP inválido. Envie 8 dígitos (ex.: 01001000).");
@@ -373,20 +435,16 @@ bot.on("message:text", async (ctx) => {
       const via = await fetchViaCEP(cep);
       if (via.erro) return ctx.reply("CEP não encontrado. Verifique e envie novamente.");
       const addr: Address = {
-        cep: via.cep,
-        logradouro: via.logradouro,
-        bairro: via.bairro,
-        localidade: via.localidade,
-        uf: via.uf,
-        complemento: via.complemento,
+        cep: via.cep, logradouro: via.logradouro, bairro: via.bairro,
+        localidade: via.localidade, uf: via.uf, complemento: via.complemento,
       };
-      drafts.set(chatId, { ...d, address: addr, step: "await_number" });
+      await mergeDraft(chatId, { address: addr, step: "await_number" as const });
       return ctx.reply(
         [
           "Endereço encontrado pelo CEP:",
           `• ${formatAddressPT(addr)}`,
           "",
-          "👉 Informe o *número* da residência (e complemento se houver).",
+          "👉 Informe o *número* da residência (e complemento se houver)."
         ].join("\n"),
         { parse_mode: "Markdown" }
       );
@@ -396,32 +454,26 @@ bot.on("message:text", async (ctx) => {
     }
   }
 
-  // Número/complemento -> escolher dia
   if (d.step === "await_number" && d.item && d.qty && d.address?.cep) {
-    // separa número do complemento (ex.: "123, apto 45")
     const m = txt.match(/^\s*(\d+)\s*(.*)$/);
     if (!m) return ctx.reply("Informe o número (ex.: 123) e, opcionalmente, complemento (ex.: 123, apto 45).");
-    const numero = m[1];
-    const complemento = m[2]?.trim() || undefined;
-
+    const numero = m[1]; const complemento = m[2]?.trim() || undefined;
     const addr = { ...(d.address || {}), numero, complemento };
-    drafts.set(chatId, { ...d, address: addr, step: "await_day" });
-
-    await ctx.reply(
-      `Endereço completo:\n*${formatAddressPT(addr)}*\n\nAgora, escolha a *data* da coleta:`,
-      { parse_mode: "Markdown", reply_markup: kbDays() }
-    );
-    return;
+    await mergeDraft(chatId, { address: addr, step: "await_day" as const });
+    return ctx.reply(`Endereço completo:\n*${formatAddressPT(addr)}*\n\nAgora, escolha a *data* da coleta:`, {
+      parse_mode: "Markdown", reply_markup: kbDays()
+    });
   }
 
-  // Se chegou texto fora de fluxo
+  // fora do fluxo
   if (!d.step) {
     return ctx.reply("Envie /start para iniciar o fluxo de agendamento. 😉");
   }
-
-  // Mensagens fora do esperado
   return ctx.reply("Beleza! Siga as instruções acima ou envie /cancel para recomeçar.");
 });
 
-// ===== exporta handler (webhook do Vercel) =====
+// log de erros
+bot.catch((err) => console.error("Erro no bot:", err));
+
+// webhook (Vercel/Render)
 export default webhookCallback(bot, "http");
