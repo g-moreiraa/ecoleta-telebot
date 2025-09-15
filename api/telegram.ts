@@ -250,48 +250,51 @@ bot.on("message:document", async (ctx) => {
 
 // ===== callback buttons (confirm item, qty, day/time, navegação) =====
 bot.on("callback_query:data", async (ctx) => {
-  const data = ctx.callbackQuery.data;
+  const data = ctx.callbackQuery.data ?? "";
+
+  // 1) SEMPRE reconhecer o callback primeiro (evita spinner infinito)
+  try { await ctx.answerCallbackQuery(); } catch { /* ignora */ }
+
+  // 2) Parse robusto: separa a chave e mantém o resto intacto (mesmo com ":")
+  const [key, ...rest] = data.split(":");
+  const payload = rest.join(":"); // preserva "2025-09-16T14:00"
+
   const chatId = ctx.chat!.id;
   const d = drafts.get(chatId) || {};
 
   // quantidade
-  if (data.startsWith("qty:")) {
-    const val = data.split(":")[1];
-    if (val === "other") {
+  if (key === "qty") {
+    if (payload === "other") {
       drafts.set(chatId, { ...d, step: "await_qty" });
-      await ctx.answerCallbackQuery();
       return ctx.editMessageText("Digite a *quantidade* (número inteiro):", { parse_mode: "Markdown" });
     }
-    const q = Math.max(1, Math.min(99, Number(val)));
+    const q = Math.max(1, Math.min(99, Number(payload)));
     drafts.set(chatId, { ...d, qty: q, step: "await_cep" });
-    await ctx.answerCallbackQuery({ text: `Qtd: ${q}` });
     return ctx.editMessageText(`Ok! Quantidade: *${q}*.\nAgora, informe seu *CEP* (somente números).`, {
       parse_mode: "Markdown",
     });
   }
 
-  // datas
-  if (data === "back:days") {
-    await ctx.answerCallbackQuery();
+  if (key === "back" && payload === "days") {
     return ctx.editMessageReplyMarkup({ reply_markup: kbDays() });
   }
-  if (data.startsWith("day:")) {
-    const dayISO = data.split(":")[1];
+
+  if (key === "day") {
+    const dayISO = payload; // ex: 2025-09-16
     drafts.set(chatId, { ...d, schedule: { ...(d.schedule || {}), day: dayISO }, step: "await_time" });
-    await ctx.answerCallbackQuery({ text: new Intl.DateTimeFormat("pt-BR", { dateStyle: "medium" }).format(new Date(dayISO)) });
     return ctx.editMessageText("Escolha um horário:", { reply_markup: kbTimes(dayISO) });
   }
-  if (data.startsWith("time:")) {
-    const iso = data.split(":")[1]; // YYYY-MM-DDTHH:mm
+
+  if (key === "time") {
+    const iso = payload; // ex: 2025-09-16T14:00
     const [dayISO, time] = iso.split("T");
     const nd = { ...d, schedule: { day: dayISO, time } };
     drafts.set(chatId, nd);
-    await ctx.answerCallbackQuery({ text: `Horário: ${time}` });
 
-    // resumo final
     const addr = nd.address!;
     const user = nd.user!;
     const item = nd.item!;
+
     const resumo = [
       "✅ *Pedido de coleta registrado!*",
       `• Nome: *${user.name}*`,
@@ -306,19 +309,16 @@ bot.on("callback_query:data", async (ctx) => {
       "",
       "_(Demo serverless: estado pode reiniciar no cold start.)_",
     ].join("\n");
-    await ctx.editMessageText(resumo, { parse_mode: "Markdown" });
 
-    // limpa estado
-    drafts.set(chatId, {});
-    return;
+    return ctx.editMessageText(resumo, { parse_mode: "Markdown" });
   }
 
-  if (data === "cancel") {
+  if (key === "cancel") {
     drafts.set(chatId, {});
-    await ctx.answerCallbackQuery({ text: "Cancelado" });
     return ctx.editMessageText("Fluxo cancelado. Envie /start para começar novamente.");
   }
 });
+
 
 // ===== fluxo de texto (dados do usuário, qty manual, CEP, número) =====
 bot.on("message:text", async (ctx) => {
