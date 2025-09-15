@@ -45,6 +45,7 @@ type Store = {
 
 function inMemoryStore(): Store {
   const mem = new Map<string, { v: unknown; exp: number }>();
+  console.warn("[STORE] usando memória (fallback).");
   return {
     async get<T>(key: string): Promise<T | undefined> {
       const hit = mem.get(key);
@@ -59,6 +60,7 @@ function inMemoryStore(): Store {
 }
 
 function upstashStore(url: string, token: string): Store {
+  console.log("[STORE] usando Upstash REST.");
   return {
     async get<T>(key: string): Promise<T | undefined> {
       try {
@@ -111,6 +113,7 @@ async function setDraft(chatId: number, draft: Draft) {
 async function mergeDraft(chatId: number, partial: Partial<Draft>) {
   const d = await getDraft(chatId);
   const nd = { ...d, ...partial };
+  console.log("[DRAFT] chat", chatId, "merge", { from: d.step, to: nd.step, hasUser: !!nd.user?.name, hasCPF: !!nd.user?.cpf, hasPhone: !!nd.user?.phone, hasItem: !!nd.item, qty: nd.qty, hasCEP: !!nd.address?.cep });
   await setDraft(chatId, nd);
   return nd;
 }
@@ -260,6 +263,19 @@ bot.command("debug", async (ctx) => {
       `Tem CEP? ${d.address?.cep ? "sim" : "não"}`
     ].join("\n")
   );
+});
+
+// KVTEST para testar Upstash set/get
+bot.command("kvtest", async (ctx) => {
+  const key = `ecoleta:test:${Date.now()}`;
+  const value = { ok: true, ts: Date.now() };
+  try {
+    await store.set(key, value, 60);
+    const got = await store.get<typeof value>(key);
+    await ctx.reply(`KVTEST: set/get OK\nchave=${key}\nvalor=${JSON.stringify(got)}`);
+  } catch (e: any) {
+    await ctx.reply(`KVTEST: erro ${e?.message || e}`);
+  }
 });
 
 // processa imagem
