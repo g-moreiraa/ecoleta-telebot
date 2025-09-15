@@ -59,6 +59,23 @@ function inMemoryStore(): Store {
   };
 }
 
+function parseUpstashResult<T>(result: any): T | undefined {
+  // 1) Se vier string pura (o valor salvo), tentar parsear
+  if (typeof result === "string") {
+    try { return JSON.parse(result) as T; } catch { return result as T; }
+  }
+  // 2) Alguns setups retornam o envelope { value: "...", ex: 60 }
+  if (result && typeof result === "object" && "value" in result) {
+    const inner = (result as any).value;
+    if (typeof inner === "string") {
+      try { return JSON.parse(inner) as T; } catch { return inner as T; }
+    }
+    return inner as T;
+  }
+  // 3) Como último recurso, devolve o que veio
+  return result as T;
+}
+
 function upstashStore(url: string, token: string): Store {
   console.log("[STORE] usando Upstash REST.");
   return {
@@ -73,8 +90,9 @@ function upstashStore(url: string, token: string): Store {
           return undefined;
         }
         const { result } = await r.json();
-        if (!result) return undefined;
-        try { return JSON.parse(result) as T; } catch { return undefined; }
+        if (result == null) return undefined;
+        const parsed = parseUpstashResult<T>(result);
+        return parsed;
       } catch (e) {
         console.error("[UPSTASH][GET] erro:", e);
         return undefined;
@@ -82,6 +100,7 @@ function upstashStore(url: string, token: string): Store {
     },
     async set<T>(key: string, value: T, ttlSec = DRAFT_TTL): Promise<void> {
       try {
+        // API REST oficial aceita POST /set/{key} com body { value, ex }
         const r = await fetch(`${url}/set/${encodeURIComponent(key)}`, {
           method: "POST",
           headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
