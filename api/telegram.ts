@@ -59,21 +59,33 @@ function inMemoryStore(): Store {
   };
 }
 
-function parseUpstashResult<T>(result: any): T | undefined {
-  // 1) Se vier string pura (o valor salvo), tentar parsear
-  if (typeof result === "string") {
-    try { return JSON.parse(result) as T; } catch { return result as T; }
-  }
-  // 2) Alguns setups retornam o envelope { value: "...", ex: 60 }
-  if (result && typeof result === "object" && "value" in result) {
-    const inner = (result as any).value;
-    if (typeof inner === "string") {
-      try { return JSON.parse(inner) as T; } catch { return inner as T; }
+// Desembrulha recursivamente respostas do Upstash (value/ex) e strings JSON
+function unwrapUpstash<T>(input: any): T | undefined {
+  let cur: any = input;
+  for (let i = 0; i < 5; i++) {
+    if (cur == null) return undefined;
+
+    // Caso 1: envelope { value: ..., ex?: ... }
+    if (typeof cur === "object" && "value" in cur) {
+      cur = (cur as any).value;
+      continue;
     }
-    return inner as T;
+
+    // Caso 2: string JSON
+    if (typeof cur === "string") {
+      try {
+        cur = JSON.parse(cur);
+        continue; // pode haver outro nível dentro
+      } catch {
+        // não é JSON: retorna a string como está
+        return cur as T;
+      }
+    }
+
+    // Caso 3: já é o objeto final
+    return cur as T;
   }
-  // 3) Como último recurso, devolve o que veio
-  return result as T;
+  return cur as T;
 }
 
 function upstashStore(url: string, token: string): Store {
@@ -91,7 +103,7 @@ function upstashStore(url: string, token: string): Store {
         }
         const { result } = await r.json();
         if (result == null) return undefined;
-        const parsed = parseUpstashResult<T>(result);
+        const parsed = unwrapUpstash<T>(result);
         return parsed;
       } catch (e) {
         console.error("[UPSTASH][GET] erro:", e);
@@ -100,10 +112,10 @@ function upstashStore(url: string, token: string): Store {
     },
     async set<T>(key: string, value: T, ttlSec = DRAFT_TTL): Promise<void> {
       try {
-        // API REST oficial aceita POST /set/{key} com body { value, ex }
         const r = await fetch(`${url}/set/${encodeURIComponent(key)}`, {
           method: "POST",
           headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+          // salvamos como string JSON (Upstash armazena strings)
           body: JSON.stringify({ value: JSON.stringify(value), ex: ttlSec }),
         });
         if (!r.ok) {
@@ -132,7 +144,11 @@ async function setDraft(chatId: number, draft: Draft) {
 async function mergeDraft(chatId: number, partial: Partial<Draft>) {
   const d = await getDraft(chatId);
   const nd = { ...d, ...partial };
-  console.log("[DRAFT] chat", chatId, "merge", { from: d.step, to: nd.step, hasUser: !!nd.user?.name, hasCPF: !!nd.user?.cpf, hasPhone: !!nd.user?.phone, hasItem: !!nd.item, qty: nd.qty, hasCEP: !!nd.address?.cep });
+  console.log("[DRAFT] chat", chatId, "merge", {
+    from: d.step, to: nd.step,
+    hasUser: !!nd.user?.name, hasCPF: !!nd.user?.cpf, hasPhone: !!nd.user?.phone,
+    hasItem: !!nd.item, qty: nd.qty, hasCEP: !!nd.address?.cep
+  });
   await setDraft(chatId, nd);
   return nd;
 }
@@ -205,7 +221,7 @@ function formatAddressPT(a: Address) {
   const parts = [
     a.logradouro && a.numero ? `${a.logradouro}, ${a.numero}` : a.logradouro,
     a.bairro,
-    a.localidade && a.uf ? `${a.localidade}/${a.uf}` : a.localidade || a.uf,
+    a.localidade && a.uf ? `${a.localidade}/${a.uf}` : (a.localidade || a.uf),
     a.complemento,
     a.cep && `CEP ${a.cep}`,
   ].filter(Boolean) as string[];
@@ -284,14 +300,21 @@ bot.command("debug", async (ctx) => {
   );
 });
 
-// KVTEST para testar Upstash set/get
+// KVTEST para testar Upstash set/get (já imprime desembrulhado)
 bot.command("kvtest", async (ctx) => {
   const key = `ecoleta:test:${Date.now()}`;
   const value = { ok: true, ts: Date.now() };
   try {
     await store.set(key, value, 60);
-    const got = await store.get<typeof value>(key);
-    await ctx.reply(`KVTEST: set/get OK\nchave=${key}\nvalor=${JSON.stringify(got)}`);
+    const rawResp = await fetch(`${process.env.UPSTASH_REDIS_REST_URL}/get/${encodeURIComponent(key)}`, {
+      headers: { Authorization: `Bearer ${process.env.UPSTASH_REDIS_REST_TOKEN!}` },
+      cache: "no-store",
+    });
+    const j = await rawResp.json();
+    const unwrapped = unwrapUpstash<typeof value>(j.result);
+    await ctx.reply(
+      `KVTEST: set/get OK\nchave=${key}\nraw=${JSON.stringify(j.result)}\nunwrapped=${JSON.stringify(unwrapped)}`
+    );
   } catch (e: any) {
     await ctx.reply(`KVTEST: erro ${e?.message || e}`);
   }
