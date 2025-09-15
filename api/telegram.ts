@@ -10,15 +10,8 @@ const token = process.env.TELEGRAM_TOKEN!;
 const PREDICT_URL = process.env.PREDICT_URL!;
 const API_KEY = process.env.API_KEY || "";
 
-// Upstash Redis (REST)
-const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL!;
-const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN!;
-
 if (!token) throw new Error("TELEGRAM_TOKEN ausente");
 if (!PREDICT_URL) throw new Error("PREDICT_URL ausente");
-if (!UPSTASH_URL || !UPSTASH_TOKEN) {
-  console.warn("⚠️ UPSTASH_REDIS_REST_URL/TOKEN ausentes — o estado pode se perder em cold start.");
-}
 
 type Pred = { label: string; score: number };
 type UserInfo = { name?: string; cpf?: string; phone?: string };
@@ -42,38 +35,78 @@ type Draft = {
   latestFileUrl?: string;
 };
 
-// ---------- Persistência (Upstash Redis REST) ----------
+// ---------- Persistência com fallback (Upstash Redis REST ou memória) ----------
 const DRAFT_TTL = 60 * 60 * 2; // 2h
 
-async function kvGet<T>(key: string): Promise<T | undefined> {
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) return undefined;
-  const r = await fetch(`${UPSTASH_URL}/get/${encodeURIComponent(key)}`, {
-    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
-    cache: "no-store",
-  });
-  if (!r.ok) return undefined;
-  const { result } = await r.json();
-  if (!result) return undefined;
-  try { return JSON.parse(result) as T; } catch { return undefined; }
+type Store = {
+  get<T>(key: string): Promise<T | undefined>;
+  set<T>(key: string, value: T, ttlSec?: number): Promise<void>;
+};
+
+function inMemoryStore(): Store {
+  const mem = new Map<string, { v: unknown; exp: number }>();
+  return {
+    async get<T>(key: string): Promise<T | undefined> {
+      const hit = mem.get(key);
+      if (!hit) return undefined;
+      if (Date.now() > hit.exp) { mem.delete(key); return undefined; }
+      return hit.v as T;
+    },
+    async set<T>(key: string, value: T, ttlSec = DRAFT_TTL): Promise<void> {
+      mem.set(key, { v: value, exp: Date.now() + ttlSec * 1000 });
+    }
+  };
 }
 
-async function kvSet<T>(key: string, value: T, ttlSec = DRAFT_TTL): Promise<void> {
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) return;
-  await fetch(`${UPSTASH_URL}/set/${encodeURIComponent(key)}`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ value: JSON.stringify(value), ex: ttlSec }),
-  });
+function upstashStore(url: string, token: string): Store {
+  return {
+    async get<T>(key: string): Promise<T | undefined> {
+      try {
+        const r = await fetch(`${url}/get/${encodeURIComponent(key)}`, {
+          headers: { Authorization: `Bearer ${token}` },
+          cache: "no-store",
+        });
+        if (!r.ok) {
+          console.error("[UPSTASH][GET] HTTP", r.status, await r.text());
+          return undefined;
+        }
+        const { result } = await r.json();
+        if (!result) return undefined;
+        try { return JSON.parse(result) as T; } catch { return undefined; }
+      } catch (e) {
+        console.error("[UPSTASH][GET] erro:", e);
+        return undefined;
+      }
+    },
+    async set<T>(key: string, value: T, ttlSec = DRAFT_TTL): Promise<void> {
+      try {
+        const r = await fetch(`${url}/set/${encodeURIComponent(key)}`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ value: JSON.stringify(value), ex: ttlSec }),
+        });
+        if (!r.ok) {
+          console.error("[UPSTASH][SET] HTTP", r.status, await r.text());
+        }
+      } catch (e) {
+        console.error("[UPSTASH][SET] erro:", e);
+      }
+    }
+  };
 }
+
+const store: Store = (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN)
+  ? upstashStore(process.env.UPSTASH_REDIS_REST_URL, process.env.UPSTASH_REDIS_REST_TOKEN)
+  : inMemoryStore();
 
 const draftKey = (chatId: number) => `ecoleta:draft:${chatId}`;
 
 async function getDraft(chatId: number): Promise<Draft> {
-  const d = await kvGet<Draft>(draftKey(chatId));
+  const d = await store.get<Draft>(draftKey(chatId));
   return d ?? { step: "name", user: {}, address: {}, schedule: {} };
 }
 async function setDraft(chatId: number, draft: Draft) {
-  await kvSet(draftKey(chatId), draft, DRAFT_TTL);
+  await store.set(draftKey(chatId), draft, DRAFT_TTL);
 }
 async function mergeDraft(chatId: number, partial: Partial<Draft>) {
   const d = await getDraft(chatId);
@@ -207,6 +240,27 @@ bot.command("start", async (ctx) => {
 bot.command("help", (ctx) =>
   ctx.reply("Comandos: /start, /cancel.\nFluxo: Nome → CPF → Telefone → Foto/Arquivo → Confirmação → Quantidade → CEP → Número → Data/Hora.")
 );
+
+// DEBUG para ver envs/estado
+bot.command("debug", async (ctx) => {
+  const chatId = ctx.chat!.id;
+  const d = await getDraft(chatId);
+  const hasUrl = !!process.env.UPSTASH_REDIS_REST_URL;
+  const hasTok = !!process.env.UPSTASH_REDIS_REST_TOKEN;
+  const storeType = hasUrl && hasTok ? "upstash" : "memory";
+  await ctx.reply(
+    [
+      `Store: ${storeType}`,
+      `Env URL: ${hasUrl ? "ok" : "missing"}`,
+      `Env TOKEN: ${hasTok ? "ok" : "missing"}`,
+      `Step atual: ${d.step}`,
+      `Tem user? ${d.user?.name ? "sim" : "não"}`,
+      `Tem item? ${d.item ? "sim" : "não"}`,
+      `Tem qty? ${d.qty ?? "não"}`,
+      `Tem CEP? ${d.address?.cep ? "sim" : "não"}`
+    ].join("\n")
+  );
+});
 
 // processa imagem
 async function handleImage(chatId: number, fileId: string) {
